@@ -1,8 +1,12 @@
-#![feature(type_ascription, step_by, slice_bytes)]
+#![feature(type_ascription, step_by)]
+
+// TODO: mem-mapped volume
+// TODO: use multiple OpenCL devices in parallel - careful about memory usage
 
 extern crate image;
 extern crate rand;
 extern crate opencl;
+extern crate num_cpus;
 
 use opencl::mem::CLBuffer;
 
@@ -10,11 +14,13 @@ use rand::{SeedableRng, StdRng};
 use rand::distributions::{IndependentSample, Range};
 
 use std::thread;
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::fs::File;
 use std::path::Path;
 use std::mem;
 use std::cmp;
+use std::collections::HashMap;
 
 fn main() {
     println!("Set parameters");
@@ -149,7 +155,7 @@ fn main() {
 	// allocate
 	let number_of_slices = cmp::min(dyn_buffer_size / (xres*yres*mem::size_of::<u8>()), zres);
 	assert!(number_of_slices > 0);
-	let mut dyn_volume = vec![background_color; xres*yres*number_of_slices];
+	//let mut dyn_volume = vec![background_color; xres*yres*number_of_slices];
 	let dynbuf: CLBuffer<u8> = ctx.create_buffer(xres*yres*number_of_slices, opencl::cl::CL_MEM_READ_WRITE);
 
 	println!("Compile and set Kernel");
@@ -190,12 +196,12 @@ fn main() {
 		let zend = cmp::min(slice_begin + number_of_slices, zres);
 		println!("Calc zslices from {} to {}", zbegin, zend);
 		// clean dynbuffer
-		for idx in 0..dyn_volume.len() {
-			dyn_volume[idx] = background_color;
-		}
+//		for idx in 0..dyn_volume.len() {
+//			dyn_volume[idx] = background_color;
+//		}
 		
 		// write dynbuffer
-		queue.write(&dynbuf, &&dyn_volume[..], ());
+		queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
 		
 		// set kernel parameters
 		kernel.set_arg(2, &zbegin);
@@ -205,36 +211,99 @@ fn main() {
 		let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
 	
 		println!("Read back volume");
-		queue.read(&dynbuf, &mut &mut dyn_volume[..], &event);
+		queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
 		
-		println!("Copy data to big buffer");
-		// copy data to big buffer
-		for idx in 0..(zend-zbegin)*xres*yres {
-			volume[zbegin*xres*yres+idx] = dyn_volume[idx];
-		}
-		//std::slice::bytes::copy_memory(&dyn_volume[..], &mut volume[zbegin*xres*yres..zend*xres*yres]);
-		println!("Data Copy done");
+//		println!("Copy data to big buffer");
+//		// copy data to big buffer
+//		for idx in 0..(zend-zbegin)*xres*yres {
+//			volume[zbegin*xres*yres+idx] = dyn_volume[idx];
+//		}
+//		//std::slice::bytes::copy_memory(&dyn_volume[..], &mut volume[zbegin*xres*yres..zend*xres*yres]);
+//		println!("Data Copy done");
 	}
 	
 	println!("Write PNGs");
+	let no_cpus = num_cpus::get();
+	// spawn threads
+	// each thread sends a ready signal to main thread
+	// main thread responds either with a - all_done_finish_up or with a
+	//                                    - here is the new work package
+	//                                    (quit: bool, z: usize)
+	// threads work through the packages until receiving the finish_up signal
+	
 	let statbuf = Arc::new(volume);
-    // write PNGs (later do it in parallel)
-    let mut pool = Vec::new();
-    for z in 0..zres {
+    let (request_tx, request_rx) = channel();
+    
+    //let mut worker_pool = Vec::new();// think about how to spawn threads iter().??;
+    let mut worker_pool = HashMap::new();
+    for thread_idx in 0..no_cpus {
+    	let (command_tx, command_rx) = channel();
+    	let local_request_tx = request_tx.clone();
     	let data = statbuf.clone();
-    	pool.push( thread::spawn( move || {
-    			let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
-				for (x, y, pixel) in newimage.enumerate_pixels_mut() {
-    				*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (z as usize)*xres*yres] as u8] );
-    			}
-    			let path = "slice".to_string() + &z.to_string() + &".png".to_string();
-    			let ref mut fout = File::create(&Path::new( &*path)).unwrap();
+    	//let worker = (command_tx, thread::spawn( move || {
+    	worker_pool.insert( thread_idx, (command_tx, thread::spawn( move || {
+    				loop {
+    					// send true over the request channel to ask for new work package
+    					local_request_tx.send(thread_idx).unwrap();
+    					// wait for answer
+    					let command: (bool, usize) = command_rx.recv().unwrap();
+    					// if quit => quit
+    					if !command.0 {
+    						println!("Thread {} exiting.", thread_idx); 
+    						break; 
+    					}
+    					// else work on package
+    					let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
+						for (x, y, pixel) in newimage.enumerate_pixels_mut() {
+    						*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (command.1 as usize)*xres*yres] as u8] );
+    					}
+    					let path = "slice".to_string() + &command.1.to_string() + &".png".to_string();
+    					let ref mut fout = File::create(&Path::new( &*path)).unwrap();
     	
-		    	let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
-    	}) );
+				    	let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
+    				}
+    				})));
+    	//worker_pool.push( worker );
     }
     
-    for _ in 0..zres {
-    	let _ = pool.pop().unwrap().join();
+    // for loop over all z values
+    for z in 0..zres {
+    	// listen on the request channel
+    	let thread_idx = request_rx.recv().unwrap();
+    	// send next z value to the first thread requesting work
+    	//worker_pool[thread_idx].0.send((true, z)).unwrap();
+    	let worker = worker_pool.get(&thread_idx).unwrap();
+    	worker.0.send((true, z)).unwrap();
     }
+    
+    // for i over worker_pool.size()
+    while !worker_pool.is_empty() {
+    	// listen on the request channel
+    	let thread_idx = request_rx.recv().unwrap();
+    	// send terminate signal + join on the thread handle
+    	let worker_handle = worker_pool.remove(&thread_idx).unwrap();
+    	worker_handle.0.send((false,0)).unwrap();
+    	let _ = worker_handle.1.join();
+    	//let thread_ref = &worker_pool[thread_idx].1;
+    	//let _ = thread_ref.join();
+    }
+    
+//    let mut pool = Vec::new();
+//    for z in 0..zres {
+//    	let data = statbuf.clone();
+//    	pool.push( thread::spawn( move || {
+//    			let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
+//				for (x, y, pixel) in newimage.enumerate_pixels_mut() {
+//    				*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (z as usize)*xres*yres] as u8] );
+//    			}
+//    			let path = "slice".to_string() + &z.to_string() + &".png".to_string();
+//    			let ref mut fout = File::create(&Path::new( &*path)).unwrap();
+//    	
+//		    	let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
+//    	}) );
+//    }
+    
+//    for _ in 0..zres {
+//    	let _ = pool.pop().unwrap().join();
+//    }
 }

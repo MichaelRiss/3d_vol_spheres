@@ -12,3 +12,4 @@ name = "vol_3d_balls_direct"
 opencl = { git = "https://github.com/luqmana/rust-opencl.git" }
 image = "*"
 rand = "*"
+num_cpus = "*"
