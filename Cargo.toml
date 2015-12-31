@@ -1,0 +1,14 @@
+[package]
+
+name = "vol_3d_balls_direct"
+version = "0.0.1"
+authors = [ "Michael Riss <Michael.Riss@gmail.com>" ]
+
+[[bin]]
+
+name = "vol_3d_balls_direct"
+
+[dependencies]
+opencl = { git = "https://github.com/luqmana/rust-opencl.git" }
+image = "*"
+rand = "*"
