@@ -7,6 +7,7 @@ extern crate image;
 extern crate rand;
 extern crate opencl;
 extern crate num_cpus;
+extern crate memmap;
 
 use opencl::mem::CLBuffer;
 
@@ -21,6 +22,8 @@ use std::path::Path;
 use std::mem;
 use std::cmp;
 use std::collections::HashMap;
+use memmap::{Mmap, Protection};
+
 
 fn main() {
     println!("Set parameters");
@@ -51,7 +54,25 @@ fn main() {
 	let mut zpos = Vec::new();
 	let mut radius = Vec::new();
 	let mut colors = Vec::new();
-	let mut volume = vec![background_color; xres*yres*zres];
+	{
+		// open/create file
+		let file_handle = File::create("temp_file.bin").unwrap();
+		// grow file
+		file_handle.set_len( (xres*yres*zres) as u64 ).unwrap();
+	} // close file by leaving scope
+	// map read/write
+	//let statbuf = Arc::new(volume);
+	
+	let mut volume_mmap = Mmap::open_path("temp_file.bin", Protection::ReadWrite).unwrap();
+	// associate with slice handle
+	//let mut volume: &[u8] = unsafe { stat_volume_mmap.as_slice() };
+	//let mut volume = vec![background_color; xres*yres*zres];
+	{
+		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
+		for idx in 0..xres*yres*zres {
+			volume[idx] = background_color;
+		}
+	}
 	
 	println!("Fill Buffers");
 	for _ in 0..num_balls {
@@ -188,38 +209,41 @@ fn main() {
 	queue.write(&colorbuf, &&colors[..], ());
 	//queue.write(&outbuf, &&volume[..], ());
 
-
-	// loop starts here
-	for slice_begin in (0..zres).step_by(number_of_slices) {
-		//	calc loop parameters: zstart, zstop
-		let zbegin = slice_begin;
-		let zend = cmp::min(slice_begin + number_of_slices, zres);
-		println!("Calc zslices from {} to {}", zbegin, zend);
-		// clean dynbuffer
-//		for idx in 0..dyn_volume.len() {
-//			dyn_volume[idx] = background_color;
-//		}
+	{
+		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
 		
-		// write dynbuffer
-		queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
+		// loop starts here
+		for slice_begin in (0..zres).step_by(number_of_slices) {
+			//	calc loop parameters: zstart, zstop
+			let zbegin = slice_begin;
+			let zend = cmp::min(slice_begin + number_of_slices, zres);
+			println!("Calc zslices from {} to {}", zbegin, zend);
+			// clean dynbuffer
+	//		for idx in 0..dyn_volume.len() {
+	//			dyn_volume[idx] = background_color;
+	//		}
 		
-		// set kernel parameters
-		kernel.set_arg(2, &zbegin);
-		kernel.set_arg(3, &zend);
+			// write dynbuffer
+			queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
+		
+			// set kernel parameters
+			kernel.set_arg(2, &zbegin);
+			kernel.set_arg(3, &zend);
 	
-		println!("Queue kernel");
-		let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
+			println!("Queue kernel");
+			let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
 	
-		println!("Read back volume");
-		queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
+			println!("Read back volume");
+			queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
 		
-//		println!("Copy data to big buffer");
-//		// copy data to big buffer
-//		for idx in 0..(zend-zbegin)*xres*yres {
-//			volume[zbegin*xres*yres+idx] = dyn_volume[idx];
-//		}
-//		//std::slice::bytes::copy_memory(&dyn_volume[..], &mut volume[zbegin*xres*yres..zend*xres*yres]);
-//		println!("Data Copy done");
+	//		println!("Copy data to big buffer");
+	//		// copy data to big buffer
+	//		for idx in 0..(zend-zbegin)*xres*yres {
+	//			volume[zbegin*xres*yres+idx] = dyn_volume[idx];
+	//		}
+	//		//std::slice::bytes::copy_memory(&dyn_volume[..], &mut volume[zbegin*xres*yres..zend*xres*yres]);
+	//		println!("Data Copy done");
+		}
 	}
 	
 	println!("Write PNGs");
@@ -231,7 +255,8 @@ fn main() {
 	//                                    (quit: bool, z: usize)
 	// threads work through the packages until receiving the finish_up signal
 	
-	let statbuf = Arc::new(volume);
+	//let statbuf = Arc::new(volume);
+	let volume_mmap_handle = Arc::new(volume_mmap);
     let (request_tx, request_rx) = channel();
     
     //let mut worker_pool = Vec::new();// think about how to spawn threads iter().??;
@@ -239,30 +264,31 @@ fn main() {
     for thread_idx in 0..no_cpus {
     	let (command_tx, command_rx) = channel();
     	let local_request_tx = request_tx.clone();
-    	let data = statbuf.clone();
+    	let child_mmap = volume_mmap_handle.clone();
     	//let worker = (command_tx, thread::spawn( move || {
     	worker_pool.insert( thread_idx, (command_tx, thread::spawn( move || {
-    				loop {
-    					// send true over the request channel to ask for new work package
-    					local_request_tx.send(thread_idx).unwrap();
-    					// wait for answer
-    					let command: (bool, usize) = command_rx.recv().unwrap();
-    					// if quit => quit
-    					if !command.0 {
-    						println!("Thread {} exiting.", thread_idx); 
-    						break; 
-    					}
-    					// else work on package
-    					let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
-						for (x, y, pixel) in newimage.enumerate_pixels_mut() {
-    						*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (command.1 as usize)*xres*yres] as u8] );
-    					}
-    					let path = "slice".to_string() + &command.1.to_string() + &".png".to_string();
-    					let ref mut fout = File::create(&Path::new( &*path)).unwrap();
+    					let data: &[u8] = unsafe { child_mmap.as_slice() };
+    					loop {
+    						// send true over the request channel to ask for new work package
+    						local_request_tx.send(thread_idx).unwrap();
+    						// wait for answer
+    						let command: (bool, usize) = command_rx.recv().unwrap();
+    						// if quit => quit
+    						if !command.0 {
+	    						println!("Thread {} exiting.", thread_idx); 
+    							break; 
+    						}
+    						// else work on package
+    						let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
+							for (x, y, pixel) in newimage.enumerate_pixels_mut() {
+	    						*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (command.1 as usize)*xres*yres] as u8] );
+    						}
+    						let path = "slice".to_string() + &command.1.to_string() + &".png".to_string();
+    						let ref mut fout = File::create(&Path::new( &*path)).unwrap();
     	
-				    	let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
-    				}
-    				})));
+				    		let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
+    					}
+    					})));
     	//worker_pool.push( worker );
     }
     

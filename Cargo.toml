@@ -13,3 +13,4 @@ opencl = { git = "https://github.com/luqmana/rust-opencl.git" }
 image = "*"
 rand = "*"
 num_cpus = "*"
+memmap = "*"
