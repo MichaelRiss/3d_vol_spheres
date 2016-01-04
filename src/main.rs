@@ -1,6 +1,5 @@
 #![feature(type_ascription, step_by)]
 
-// TODO: mem-mapped volume
 // TODO: use multiple OpenCL devices in parallel - careful about memory usage
 
 extern crate image;
