@@ -7,6 +7,7 @@ extern crate rand;
 extern crate opencl;
 extern crate num_cpus;
 extern crate memmap;
+extern crate time;
 
 use opencl::mem::CLBuffer;
 
@@ -22,7 +23,7 @@ use std::mem;
 use std::cmp;
 use std::collections::HashMap;
 use memmap::{Mmap, Protection};
-
+use time::PreciseTime;
 
 fn main() {
     println!("Set parameters");
@@ -47,7 +48,6 @@ fn main() {
     // prep buffers
     println!("Prep Buffers");
     // Set up our work dimensions / data set size:
-//    let xpos = SimpleDims::OneDim(num_balls);
 	let mut xpos = Vec::new();
 	let mut ypos = Vec::new();
 	let mut zpos = Vec::new();
@@ -60,12 +60,8 @@ fn main() {
 		file_handle.set_len( (xres*yres*zres) as u64 ).unwrap();
 	} // close file by leaving scope
 	// map read/write
-	//let statbuf = Arc::new(volume);
 	
 	let mut volume_mmap = Mmap::open_path("temp_file.bin", Protection::ReadWrite).unwrap();
-	// associate with slice handle
-	//let mut volume: &[u8] = unsafe { stat_volume_mmap.as_slice() };
-	//let mut volume = vec![background_color; xres*yres*zres];
 	{
 		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
 		for idx in 0..xres*yres*zres {
@@ -84,39 +80,6 @@ fn main() {
 	}
     
     // OpenCL source
-//	let source = r#"
-//		__kernel void draw_balls(
-//					  __private unsigned long const xres,
-//					  __private unsigned long const yres,
-//					  __private unsigned long const zres,
-//					  __global int const* const xpos,
-//					  __global int const* const ypos,
-//					  __global int const* const zpos,
-//					  __global int const* const radius,
-//					  __global uchar const* const color,
-//					  __global uchar* const buffer )
-//		{
-//			size_t idx = get_global_id(0);
-//			
-//			int sqradius = radius[idx]*radius[idx];			
-//			// tripple loop
-//			for( int z = max(0, zpos[idx]-radius[idx]-1); z < min((int)zres, zpos[idx]+radius[idx]+1); z++ ){
-//				for( int y = max(0, ypos[idx]-radius[idx]-1); y < min((int)yres, ypos[idx]+radius[idx]+1); y++ ){
-//					for( int x = max(0, xpos[idx]-radius[idx]-1); x < min((int)xres, xpos[idx]+radius[idx]+1); x++ ){
-//						int dx = xpos[idx]-x;
-//						int dy = ypos[idx]-y;
-//						int dz = zpos[idx]-z;
-//						int sqdistance = dx*dx + dy*dy + dz*dz;
-//						if( sqdistance < sqradius ){
-//							buffer[x + y * xres + z * xres * yres] = color[idx]; 
-//						}
-//					}
-//				}
-//			}
-//		}
-//		"#;
-		
-		// TODO: color priorities
 		// TODO: rewrite kernel and parameter passing to use 64bit addressing consistently
 		let source = r#"
 		__kernel void draw_balls(
@@ -152,7 +115,8 @@ fn main() {
 		}
 	"#;
 	
-	let (device, ctx, queue) = opencl::util::create_compute_context().unwrap();	
+	//let (device, ctx, queue) = opencl::util::create_compute_context().unwrap();
+	let (device, ctx, queue) = opencl::util::create_compute_context_prefer(opencl::util::PreferedType::CPUPrefered).unwrap();
 
 	println!("Prep OpenCL buffers");
 	let xbuf: CLBuffer<i32> = ctx.create_buffer(xpos.len(), opencl::cl::CL_MEM_READ_ONLY);
@@ -175,7 +139,6 @@ fn main() {
 	// allocate
 	let number_of_slices = cmp::min(dyn_buffer_size / (xres*yres*mem::size_of::<u8>()), zres);
 	assert!(number_of_slices > 0);
-	//let mut dyn_volume = vec![background_color; xres*yres*number_of_slices];
 	let dynbuf: CLBuffer<u8> = ctx.create_buffer(xres*yres*number_of_slices, opencl::cl::CL_MEM_READ_WRITE);
 
 	println!("Compile and set Kernel");
@@ -206,10 +169,11 @@ fn main() {
 	queue.write(&zbuf, &&zpos[..], ());
 	queue.write(&radiusbuf, &&radius[..], ());
 	queue.write(&colorbuf, &&colors[..], ());
-	//queue.write(&outbuf, &&volume[..], ());
 
 	{
 		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
+		
+		let starttime = PreciseTime::now();
 		
 		// loop starts here
 		for slice_begin in (0..zres).step_by(number_of_slices) {
@@ -217,10 +181,6 @@ fn main() {
 			let zbegin = slice_begin;
 			let zend = cmp::min(slice_begin + number_of_slices, zres);
 			println!("Calc zslices from {} to {}", zbegin, zend);
-			// clean dynbuffer
-	//		for idx in 0..dyn_volume.len() {
-	//			dyn_volume[idx] = background_color;
-	//		}
 		
 			// write dynbuffer
 			queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
@@ -234,15 +194,11 @@ fn main() {
 	
 			println!("Read back volume");
 			queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
-		
-	//		println!("Copy data to big buffer");
-	//		// copy data to big buffer
-	//		for idx in 0..(zend-zbegin)*xres*yres {
-	//			volume[zbegin*xres*yres+idx] = dyn_volume[idx];
-	//		}
-	//		//std::slice::bytes::copy_memory(&dyn_volume[..], &mut volume[zbegin*xres*yres..zend*xres*yres]);
-	//		println!("Data Copy done");
 		}
+		
+		let endtime = PreciseTime::now();
+		
+		println!("Loop took {} seconds.", starttime.to(endtime));
 	}
 	
 	println!("Write PNGs");
@@ -254,17 +210,15 @@ fn main() {
 	//                                    (quit: bool, z: usize)
 	// threads work through the packages until receiving the finish_up signal
 	
-	//let statbuf = Arc::new(volume);
+	
 	let volume_mmap_handle = Arc::new(volume_mmap);
     let (request_tx, request_rx) = channel();
     
-    //let mut worker_pool = Vec::new();// think about how to spawn threads iter().??;
     let mut worker_pool = HashMap::new();
     for thread_idx in 0..no_cpus {
     	let (command_tx, command_rx) = channel();
     	let local_request_tx = request_tx.clone();
     	let child_mmap = volume_mmap_handle.clone();
-    	//let worker = (command_tx, thread::spawn( move || {
     	worker_pool.insert( thread_idx, (command_tx, thread::spawn( move || {
     					let data: &[u8] = unsafe { child_mmap.as_slice() };
     					loop {
@@ -288,7 +242,6 @@ fn main() {
 				    		let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
     					}
     					})));
-    	//worker_pool.push( worker );
     }
     
     // for loop over all z values
@@ -296,7 +249,6 @@ fn main() {
     	// listen on the request channel
     	let thread_idx = request_rx.recv().unwrap();
     	// send next z value to the first thread requesting work
-    	//worker_pool[thread_idx].0.send((true, z)).unwrap();
     	let worker = worker_pool.get(&thread_idx).unwrap();
     	worker.0.send((true, z)).unwrap();
     }
@@ -309,26 +261,5 @@ fn main() {
     	let worker_handle = worker_pool.remove(&thread_idx).unwrap();
     	worker_handle.0.send((false,0)).unwrap();
     	let _ = worker_handle.1.join();
-    	//let thread_ref = &worker_pool[thread_idx].1;
-    	//let _ = thread_ref.join();
     }
-    
-//    let mut pool = Vec::new();
-//    for z in 0..zres {
-//    	let data = statbuf.clone();
-//    	pool.push( thread::spawn( move || {
-//    			let mut newimage = image::ImageBuffer::new( xres as u32, yres as u32 );
-//				for (x, y, pixel) in newimage.enumerate_pixels_mut() {
-//    				*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (z as usize)*xres*yres] as u8] );
-//    			}
-//    			let path = "slice".to_string() + &z.to_string() + &".png".to_string();
-//    			let ref mut fout = File::create(&Path::new( &*path)).unwrap();
-//    	
-//		    	let _ = image::ImageLuma8(newimage).save(fout, image::PNG);
-//    	}) );
-//    }
-    
-//    for _ in 0..zres {
-//    	let _ = pool.pop().unwrap().join();
-//    }
 }
