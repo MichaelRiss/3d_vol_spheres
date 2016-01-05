@@ -1,4 +1,4 @@
-#![feature(type_ascription, step_by)]
+#![feature(type_ascription, vec_push_all, convert)]
 
 // TODO: use multiple OpenCL devices in parallel - careful about memory usage
 
@@ -22,7 +22,7 @@ use std::path::Path;
 use std::mem;
 use std::cmp;
 use std::collections::HashMap;
-use memmap::{Mmap, Protection};
+use memmap::{Mmap, Protection, MmapViewSync};
 use time::PreciseTime;
 
 fn main() {
@@ -68,6 +68,8 @@ fn main() {
 			volume[idx] = background_color;
 		}
 	}
+	let mut volume_mmap_view = volume_mmap.into_view_sync();
+	//let volume_mmap_handle = Arc::new(Mutex::new(Some(volume_mmap)));
 	
 	println!("Fill Buffers");
 	for _ in 0..num_balls {
@@ -78,6 +80,13 @@ fn main() {
 		colors.push(colorbetween.ind_sample(&mut rng));
 		//colors.push(ball_color);
 	}
+	
+	// strip mutability
+	let xpos = xpos;
+	let ypos = ypos;
+	let zpos = zpos;
+	let radius = radius;
+	let colors = colors;
     
     // OpenCL source
 		// TODO: rewrite kernel and parameter passing to use 64bit addressing consistently
@@ -115,91 +124,163 @@ fn main() {
 		}
 	"#;
 	
-	//let (device, ctx, queue) = opencl::util::create_compute_context().unwrap();
-	let (device, ctx, queue) = opencl::util::create_compute_context_prefer(opencl::util::PreferedType::CPUPrefered).unwrap();
+	// get list of devices
+	let platforms = opencl::hl::get_platforms();
 
-	println!("Prep OpenCL buffers");
-	let xbuf: CLBuffer<i32> = ctx.create_buffer(xpos.len(), opencl::cl::CL_MEM_READ_ONLY);
-	let ybuf: CLBuffer<i32> = ctx.create_buffer(ypos.len(), opencl::cl::CL_MEM_READ_ONLY);
-	let zbuf: CLBuffer<i32> = ctx.create_buffer(zpos.len(), opencl::cl::CL_MEM_READ_ONLY);
-	let radiusbuf: CLBuffer<i32> = ctx.create_buffer(radius.len(), opencl::cl::CL_MEM_READ_ONLY);
-	let colorbuf: CLBuffer<u8> = ctx.create_buffer(colors.len(), opencl::cl::CL_MEM_READ_ONLY);
-	
-	// check max mem
-	let total_mem = device.global_mem_size();
-	let max_block_size = device.max_mem_alloc_size();
-	// subtract the other buffers
-	let stat_buffer_size =  xpos.len() * mem::size_of::<i32>() +
-							ypos.len() * mem::size_of::<i32>() + 
-							zpos.len() * mem::size_of::<i32>() +
-							radius.len() * mem::size_of::<i32>() + 
-							colors.len() *  mem::size_of::<u8>();
-	// size the buffer right
-	let dyn_buffer_size = cmp::min(total_mem as usize- stat_buffer_size, max_block_size as usize);
-	// allocate
-	let number_of_slices = cmp::min(dyn_buffer_size / (xres*yres*mem::size_of::<u8>()), zres);
-	assert!(number_of_slices > 0);
-	let dynbuf: CLBuffer<u8> = ctx.create_buffer(xres*yres*number_of_slices, opencl::cl::CL_MEM_READ_WRITE);
-
-	println!("Compile and set Kernel");
-	
-	let program = ctx.create_program_from_source(source);
-	match program.build(&device) {
-		Ok(v) => println!( "OpenCL program compiled ok: {}", v ),
-		Err(e) => panic!( "OpenCL program could not be compiled: {}", e ),
+	let mut devices = Vec::new();
+	for platform in &platforms {
+    	devices.push_all( platform.get_devices().as_slice() );
+    }
+	for device in &devices {
+		println!( "Device: {}", device.name() );
 	}
-	let kernel = program.create_kernel("draw_balls");
-
-	println!("Set static kernel parameters");
-	kernel.set_arg(0, &xres);
-	kernel.set_arg(1, &yres);
-	//kernel.set_arg(2, &zbegin);
-	//kernel.set_arg(3, &zend);
-	kernel.set_arg(4, &xbuf);
-	kernel.set_arg(5, &ybuf);
-	kernel.set_arg(6, &zbuf);
-	kernel.set_arg(7, &radiusbuf);
-	kernel.set_arg(8, &colorbuf);
-	kernel.set_arg(9, &dynbuf);
-
-	println!("Push static buffers");
 	
-	queue.write(&xbuf, &&xpos[..], ());
-	queue.write(&ybuf, &&ypos[..], ());
-	queue.write(&zbuf, &&zpos[..], ());
-	queue.write(&radiusbuf, &&radius[..], ());
-	queue.write(&colorbuf, &&colors[..], ());
-
 	{
-		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
+		//let volume_mmap_handle = Arc::new(Mutex::new(volume_mmap));
+		let mut worker_pool = HashMap::new();
+		let (request_tx, request_rx) = channel();
 		
-		let starttime = PreciseTime::now();
-		
-		// loop starts here
-		for slice_begin in (0..zres).step_by(number_of_slices) {
-			//	calc loop parameters: zstart, zstop
-			let zbegin = slice_begin;
-			let zend = cmp::min(slice_begin + number_of_slices, zres);
-			println!("Calc zslices from {} to {}", zbegin, zend);
-		
-			// write dynbuffer
-			queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
-		
-			// set kernel parameters
-			kernel.set_arg(2, &zbegin);
-			kernel.set_arg(3, &zend);
+		// for loop to create threads
+		for thread_idx in 0..devices.len(){
+			let (command_tx, command_rx) = channel();
+    		let local_request_tx = request_tx.clone();
+    		let device = devices[thread_idx].clone();
+    		let xpos = xpos.clone();
+    		let ypos = ypos.clone();
+    		let zpos = zpos.clone();
+    		let radius = radius.clone();
+    		let colors = colors.clone();
+    		//let volume_mmap_handle = volume_mmap_handle.clone();
+    		worker_pool.insert(thread_idx, (command_tx, thread::spawn( move || {
+    							// open device
+    							//let device = devices[thread_idx].clone();
+    							let context = device.create_context();
+        						let queue = context.create_command_queue(&device);
+        						// allocate buffers
+        						let xbuf: CLBuffer<i32> = context.create_buffer(xpos.len(), opencl::cl::CL_MEM_READ_ONLY);
+								let ybuf: CLBuffer<i32> = context.create_buffer(ypos.len(), opencl::cl::CL_MEM_READ_ONLY);
+								let zbuf: CLBuffer<i32> = context.create_buffer(zpos.len(), opencl::cl::CL_MEM_READ_ONLY);
+								let radiusbuf: CLBuffer<i32> = context.create_buffer(radius.len(), opencl::cl::CL_MEM_READ_ONLY);
+								let colorbuf: CLBuffer<u8> = context.create_buffer(colors.len(), opencl::cl::CL_MEM_READ_ONLY);
+								// check max mem
+								let total_mem = device.global_mem_size();
+								let max_block_size = device.max_mem_alloc_size();
+								// subtract the other buffers
+								let stat_buffer_size =  xpos.len() * mem::size_of::<i32>() +
+														ypos.len() * mem::size_of::<i32>() + 
+														zpos.len() * mem::size_of::<i32>() +
+														radius.len() * mem::size_of::<i32>() + 
+														colors.len() *  mem::size_of::<u8>();
+								// size the buffer right
+								let dyn_buffer_size = cmp::min(total_mem as usize- stat_buffer_size, max_block_size as usize);
+								// allocate
+								let number_of_slices = cmp::min(dyn_buffer_size / (xres*yres*mem::size_of::<u8>()), zres);
+								assert!(number_of_slices > 0);
+								let dynbuf: CLBuffer<u8> = context.create_buffer(xres*yres*number_of_slices, opencl::cl::CL_MEM_READ_WRITE);
+    							
+    							
+    							println!("Compile and set Kernel");
 	
-			println!("Queue kernel");
-			let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
+								let program = context.create_program_from_source(source);
+								match program.build(&device) {
+									Ok(v) => println!( "OpenCL program compiled ok: {}", v ),
+									Err(e) => panic!( "OpenCL program could not be compiled: {}", e ),
+								}
+								let kernel = program.create_kernel("draw_balls");
+
+								println!("Set static kernel parameters");
+								kernel.set_arg(0, &xres);
+								kernel.set_arg(1, &yres);
+								//kernel.set_arg(2, &zbegin);
+								//kernel.set_arg(3, &zend);
+								kernel.set_arg(4, &xbuf);
+								kernel.set_arg(5, &ybuf);
+								kernel.set_arg(6, &zbuf);
+								kernel.set_arg(7, &radiusbuf);
+								kernel.set_arg(8, &colorbuf);
+								kernel.set_arg(9, &dynbuf);
+
+								println!("Push static buffers");
+		
+								queue.write(&xbuf, &&xpos[..], ());
+								queue.write(&ybuf, &&ypos[..], ());
+								queue.write(&zbuf, &&zpos[..], ());
+								queue.write(&radiusbuf, &&radius[..], ());
+								queue.write(&colorbuf, &&colors[..], ());
+    							
+    							// loop
+    							loop {
+    								//   request x slices
+									local_request_tx.send((thread_idx, number_of_slices)).unwrap();
+		    						// wait for answer
+		    						let command: (usize, usize, Option<MmapViewSync>) = command_rx.recv().unwrap();
+    								// if command == 0 => quit
+    								if command.0 == command.1 {
+	    								println!("Thread {} exiting.", thread_idx); 
+    									break; 
+    								}
+    								// else work on package
+    								let mut volume_mmap_view = command.2.unwrap();
+    								//	calc loop parameters: zstart, zstop
+    								let zbegin = command.0;
+    								let zend = cmp::min(command.1, zres);
+
+    								// write dynbuffer
+    								{
+    									let volume: &[u8] = unsafe { volume_mmap_view.as_slice() };
+										//queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
+										queue.write(&dynbuf, &&volume[..], ());
+									}				
+    					
+									// set kernel parameters
+									kernel.set_arg(2, &zbegin);
+									kernel.set_arg(3, &zend);
 	
-			println!("Read back volume");
-			queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
+									println!("Queue kernel");
+									let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
+	
+									println!("Read back volume");
+									{
+										let mut volume: &mut [u8] = unsafe { volume_mmap_view.as_mut_slice() };
+										//queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
+										queue.read(&dynbuf, &mut &mut volume[..], &event);
+									}
+    							}
+    						})));
 		}
 		
-		let endtime = PreciseTime::now();
+		// while loop to distribute work
+		let starttime = PreciseTime::now(); 
+		let mut zlevel = 0;
+		while zlevel < zres {
+			// listen on the request channel
+    		let (thread_idx, no_slices) = request_rx.recv().unwrap();
+    		let offset = mem::size_of::<u8>().checked_mul(cmp::min(no_slices, zres-zlevel)*xres*yres as usize).unwrap();
+    		let (send_mmap, volume_mmap_view2) = volume_mmap_view.split_at(offset).unwrap();
+    		volume_mmap_view = volume_mmap_view2;
+    		// send next z value to the first thread requesting work
+    		let worker = worker_pool.get(&thread_idx).unwrap();
+    		worker.0.send((zlevel, zlevel + no_slices, Some(send_mmap))).unwrap();
+    		zlevel += no_slices;
+		}
 		
-		println!("Loop took {} seconds.", starttime.to(endtime));
+		println!("Waiting for threads.");
+		
+		// for i over worker_pool.size()
+    	while !worker_pool.is_empty() {
+    		// listen on the request channel
+    		let (thread_idx, _) = request_rx.recv().unwrap();
+    		println!("Thread {} requests new work, needs to quit.", thread_idx);
+    		// send terminate signal + join on the thread handle
+    		let worker_handle = worker_pool.remove(&thread_idx).unwrap();
+    		worker_handle.0.send((0, 0, None)).unwrap();
+    		let _ = worker_handle.1.join();
+    	}
+    	let endtime = PreciseTime::now();
+    	println!("Loop took {} seconds.", starttime.to(endtime));
 	}
+	
+		
 	
 	println!("Write PNGs");
 	let no_cpus = num_cpus::get();
@@ -211,7 +292,9 @@ fn main() {
 	// threads work through the packages until receiving the finish_up signal
 	
 	
-	let volume_mmap_handle = Arc::new(volume_mmap);
+	let volume_mmap = Mmap::open_path("temp_file.bin", Protection::ReadWrite).unwrap();
+	
+	let volume_mmap_handle = Arc::new( volume_mmap );
     let (request_tx, request_rx) = channel();
     
     let mut worker_pool = HashMap::new();
