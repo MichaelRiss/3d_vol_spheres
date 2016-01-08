@@ -1,7 +1,5 @@
 #![feature(type_ascription, vec_push_all, convert)]
 
-// TODO: use multiple OpenCL devices in parallel - careful about memory usage
-
 extern crate image;
 extern crate rand;
 extern crate opencl;
@@ -141,7 +139,7 @@ fn main() {
 		let (request_tx, request_rx) = channel();
 		
 		// for loop to create threads
-		for thread_idx in 0..devices.len(){
+		for thread_idx in 1..devices.len(){
 			let (command_tx, command_rx) = channel();
     		let local_request_tx = request_tx.clone();
     		let device = devices[thread_idx].clone();
