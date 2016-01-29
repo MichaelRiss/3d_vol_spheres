@@ -1,4 +1,5 @@
 #![feature(type_ascription, vec_push_all, convert)]
+#![allow(deprecated)]
 
 extern crate image;
 extern crate rand;
@@ -6,6 +7,7 @@ extern crate opencl;
 extern crate num_cpus;
 extern crate memmap;
 extern crate time;
+extern crate gtk;
 
 use opencl::mem::CLBuffer;
 
@@ -20,20 +22,164 @@ use std::path::Path;
 use std::mem;
 use std::cmp;
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 use memmap::{Mmap, Protection, MmapViewSync};
 use time::PreciseTime;
+use gtk::widgets::Builder;
+use gtk::traits::*;
+use gtk::{Window, Button, Box, FileChooserDialog, FileChooserAction, ResponseType, Entry, SpinButton};
+use gtk::signal::Inhibit;
 
 fn main() {
-    println!("Set parameters");
-    // set parameters
-    let num_balls: usize = 10000;
-    let max_radius = 40;
-    let xres: usize = 5000;
-    let yres: usize = 5000;
-    let zres: usize = 100;
-    
-    let background_color: u8 = 255;
-//    let ball_color: u8 = 0;
+	if gtk::init().is_err() {
+    	println!("Failed to initialize GTK.");
+        return;
+    }
+	let glade_src = include_str!("GUI.glade");
+    let builder = Builder::new_from_string(glade_src).unwrap();
+	
+	// populate OpenCL device list
+	// get list of devices
+	let platforms = opencl::hl::get_platforms();
+
+	let mut devices = Vec::new();
+	for platform in &platforms {
+    	devices.push_all( platform.get_devices().as_slice() );
+    }
+	for device in &devices {
+		println!( "Device: {}", device.name() );		
+	}
+	
+	unsafe {
+		let window: Window = builder.get_object("application_window").unwrap();
+		let opencl_box: Box = builder.get_object("opencl_box").unwrap();
+		let start_button: Button = builder.get_object("start_button").unwrap();
+		let start_button = RefCell::new(start_button);		
+		let output_directory_label: Entry = builder.get_object("directory_text").unwrap();
+		let output_directory_label = RefCell::new(output_directory_label);
+		let choose_output_directory_button: Button = builder.get_object("choose_output_directory_button").unwrap();
+		
+		window.connect_delete_event(|_, _| {
+        	gtk::main_quit();
+        	Inhibit(false)
+        });
+		
+		// OpenCL list
+		let mut check_buttons = Vec::new();
+		for device in &devices {
+			println!( "Device: {}", device.name() );	
+			let mut name = device.name();
+			name.pop();
+			let check_button = gtk::CheckButton::new_with_label(&name).unwrap();
+			opencl_box.pack_start(&check_button, true, true, 0);
+			check_buttons.push( check_button );
+		}
+		let check_buttons = RefCell::new(check_buttons);
+		
+		// Start button update call
+		let local_check_buttons = check_buttons.clone();
+		let local_directory_label = output_directory_label.clone();
+		let local_start_button = start_button.clone();
+		let start_button_update = move || {
+			// accessing reference to check_buttons
+			let local_buttons = local_check_buttons.borrow_mut();
+			let directory_label = local_directory_label.borrow();
+
+			let mut start_possible = true;
+			let label_text = directory_label.get_text().unwrap();
+					
+			if label_text.is_empty() {
+				start_possible = false;
+			}
+			// traverse all checkbuttons
+			let mut cl_start_possible = false;
+			for local_button in local_buttons.iter() {
+				// if one is set => true
+				if local_button.get_active() {
+					cl_start_possible = true;
+					break;
+				}
+			}
+			if !cl_start_possible {
+				start_possible = false;
+			}
+					
+			// if true => set start_button active else inactive
+			let start_button = local_start_button.borrow_mut();
+			start_button.set_sensitive( start_possible );
+		};
+		let start_button_update = Rc::new(start_button_update);
+		
+		// traverse check_buttons
+		let buttons = check_buttons.borrow();
+		for button in buttons.iter() {
+			let own_closure = start_button_update.clone();
+			button.connect_clicked( move |_| {
+					own_closure();
+				}
+			);
+		}
+		
+		// output directory handler
+		let own_closure = start_button_update.clone();
+		let directory_label = output_directory_label.clone();
+		choose_output_directory_button.connect_clicked( move |_| {
+				// create new file choose dialog
+				let directory_dialog = 
+					FileChooserDialog::new( "Choose Output Directory", 
+											None, 
+											FileChooserAction::CreateFolder, 
+											dialog::buttons::OK_CANCEL );
+				let result = directory_dialog.run();
+				directory_dialog.hide();
+				if result == ResponseType::Ok as i32 {
+					// fetch directory path
+					let directory = directory_dialog.get_filename().unwrap();
+					// update label
+					directory_label.borrow_mut().set_text(&directory);
+					// call update funtion
+					own_closure();
+				}
+			}
+		);
+		
+		// Start button calls function
+		let no_balls_button: SpinButton = builder.get_object("no_balls_button").unwrap();
+		let xresbutton: SpinButton = builder.get_object("xresbutton").unwrap();
+		let yresbutton: SpinButton = builder.get_object("yresbutton").unwrap();
+		let zresbutton: SpinButton = builder.get_object("zresbutton").unwrap();
+		let max_radius_button: SpinButton = builder.get_object("max_radius_button").unwrap();
+		let background_color_button: SpinButton = builder.get_object("background_color_button").unwrap();
+		let directory_label = output_directory_label.clone();
+		start_button.borrow_mut().connect_clicked(move |_| {
+				// fetch all parameters
+				let num_balls = no_balls_button.get_value_as_int() as usize;
+				let xres = xresbutton.get_value_as_int() as usize;
+				let yres = yresbutton.get_value_as_int() as usize;
+				let zres = zresbutton.get_value_as_int() as usize;
+				let max_radius = max_radius_button.get_value_as_int();
+				let background_color = background_color_button.get_value_as_int() as u8;
+				let directory = directory_label.borrow().get_text().unwrap(); 
+				do_calculation( num_balls, xres, yres, zres, max_radius, background_color, directory );
+        	}
+		);
+		
+		window.show_all();
+	}
+	
+	gtk::main();
+}
+
+fn do_calculation( num_balls: usize, 
+				   xres: usize, 
+				   yres: usize,
+				   zres: usize,
+				   max_radius: i32,
+				   background_color: u8,
+				   directory: String ) {
+	let mut temp_file = directory.clone();
+	temp_file.push_str("/temp_file.bin");
     
     let seed: &[_] = &[1, 2, 3, 4];
     let mut rng: StdRng = SeedableRng::from_seed(seed);
@@ -53,13 +199,13 @@ fn main() {
 	let mut colors = Vec::new();
 	{
 		// open/create file
-		let file_handle = File::create("temp_file.bin").unwrap();
+		let file_handle = File::create( &temp_file ).unwrap();
 		// grow file
 		file_handle.set_len( (xres*yres*zres) as u64 ).unwrap();
 	} // close file by leaving scope
 	// map read/write
 	
-	let mut volume_mmap = Mmap::open_path("temp_file.bin", Protection::ReadWrite).unwrap();
+	let mut volume_mmap = Mmap::open_path(&temp_file, Protection::ReadWrite).unwrap();
 	{
 		let mut volume: &mut [u8] = unsafe { volume_mmap.as_mut_slice() };
 		for idx in 0..xres*yres*zres {
@@ -67,7 +213,6 @@ fn main() {
 		}
 	}
 	let mut volume_mmap_view = volume_mmap.into_view_sync();
-	//let volume_mmap_handle = Arc::new(Mutex::new(Some(volume_mmap)));
 	
 	println!("Fill Buffers");
 	for _ in 0..num_balls {
@@ -134,7 +279,6 @@ fn main() {
 	}
 	
 	{
-		//let volume_mmap_handle = Arc::new(Mutex::new(volume_mmap));
 		let mut worker_pool = HashMap::new();
 		let (request_tx, request_rx) = channel();
 		
@@ -148,10 +292,8 @@ fn main() {
     		let zpos = zpos.clone();
     		let radius = radius.clone();
     		let colors = colors.clone();
-    		//let volume_mmap_handle = volume_mmap_handle.clone();
     		worker_pool.insert(thread_idx, (command_tx, thread::spawn( move || {
     							// open device
-    							//let device = devices[thread_idx].clone();
     							let context = device.create_context();
         						let queue = context.create_command_queue(&device);
         						// allocate buffers
@@ -226,7 +368,6 @@ fn main() {
     								// write dynbuffer
     								{
     									let volume: &[u8] = unsafe { volume_mmap_view.as_slice() };
-										//queue.write(&dynbuf, &&volume[zbegin*xres*yres..zend*xres*yres], ());
 										queue.write(&dynbuf, &&volume[..], ());
 									}				
     					
@@ -240,7 +381,6 @@ fn main() {
 									println!("Read back volume");
 									{
 										let mut volume: &mut [u8] = unsafe { volume_mmap_view.as_mut_slice() };
-										//queue.read(&dynbuf, &mut &mut volume[zbegin*xres*yres..zend*xres*yres], &event);
 										queue.read(&dynbuf, &mut &mut volume[..], &event);
 									}
     							}
@@ -290,7 +430,7 @@ fn main() {
 	// threads work through the packages until receiving the finish_up signal
 	
 	
-	let volume_mmap = Mmap::open_path("temp_file.bin", Protection::ReadWrite).unwrap();
+	let volume_mmap = Mmap::open_path(&temp_file, Protection::ReadWrite).unwrap();
 	
 	let volume_mmap_handle = Arc::new( volume_mmap );
     let (request_tx, request_rx) = channel();
@@ -300,6 +440,7 @@ fn main() {
     	let (command_tx, command_rx) = channel();
     	let local_request_tx = request_tx.clone();
     	let child_mmap = volume_mmap_handle.clone();
+    	let directory_clone = directory.clone();
     	worker_pool.insert( thread_idx, (command_tx, thread::spawn( move || {
     					let data: &[u8] = unsafe { child_mmap.as_slice() };
     					loop {
@@ -317,7 +458,7 @@ fn main() {
 							for (x, y, pixel) in newimage.enumerate_pixels_mut() {
 	    						*pixel = image::Luma( [data[x as usize + (y as usize)*xres + (command.1 as usize)*xres*yres] as u8] );
     						}
-    						let path = "slice".to_string() + &command.1.to_string() + &".png".to_string();
+    						let path = directory_clone.clone() + &"/slice".to_string() + &command.1.to_string() + &".png".to_string();
     						let ref mut fout = File::create(&Path::new( &*path)).unwrap();
     	
 				    		let _ = image::ImageLuma8(newimage).save(fout, image::PNG);

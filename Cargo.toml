@@ -1,15 +1,15 @@
 [package]
 
-name = "vol_3d_balls_direct"
+name = "3d_vol_balls"
 version = "0.0.1"
 authors = [ "Michael Riss <Michael.Riss@gmail.com>" ]
 
 [[bin]]
 
-name = "vol_3d_balls_direct"
+name = "3d_vol_balls"
 
 [dependencies]
-opencl = { git = "https://github.com/luqmana/rust-opencl.git" }
+opencl = { git = "https://github.com/MichaelRiss/rust-opencl.git", branch = "extended_deviceinfo" }
 image = "*"
 rand = "*"
 num_cpus = "*"
