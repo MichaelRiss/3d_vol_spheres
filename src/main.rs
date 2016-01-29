@@ -145,7 +145,7 @@ fn main() {
 		);
 		
 		// Start button calls function
-		let no_balls_button: SpinButton = builder.get_object("no_balls_button").unwrap();
+		let no_spheres_button: SpinButton = builder.get_object("no_spheres_button").unwrap();
 		let xresbutton: SpinButton = builder.get_object("xresbutton").unwrap();
 		let yresbutton: SpinButton = builder.get_object("yresbutton").unwrap();
 		let zresbutton: SpinButton = builder.get_object("zresbutton").unwrap();
@@ -154,14 +154,14 @@ fn main() {
 		let directory_label = output_directory_label.clone();
 		start_button.borrow_mut().connect_clicked(move |_| {
 				// fetch all parameters
-				let num_balls = no_balls_button.get_value_as_int() as usize;
+				let num_spheres = no_spheres_button.get_value_as_int() as usize;
 				let xres = xresbutton.get_value_as_int() as usize;
 				let yres = yresbutton.get_value_as_int() as usize;
 				let zres = zresbutton.get_value_as_int() as usize;
 				let max_radius = max_radius_button.get_value_as_int();
 				let background_color = background_color_button.get_value_as_int() as u8;
 				let directory = directory_label.borrow().get_text().unwrap(); 
-				do_calculation( num_balls, xres, yres, zres, max_radius, background_color, directory );
+				do_calculation( num_spheres, xres, yres, zres, max_radius, background_color, directory );
         	}
 		);
 		
@@ -171,7 +171,7 @@ fn main() {
 	gtk::main();
 }
 
-fn do_calculation( num_balls: usize, 
+fn do_calculation( num_spheres: usize, 
 				   xres: usize, 
 				   yres: usize,
 				   zres: usize,
@@ -215,13 +215,13 @@ fn do_calculation( num_balls: usize,
 	let mut volume_mmap_view = volume_mmap.into_view_sync();
 	
 	println!("Fill Buffers");
-	for _ in 0..num_balls {
+	for _ in 0..num_spheres {
 		xpos.push(xbetween.ind_sample(&mut rng));
 		ypos.push(ybetween.ind_sample(&mut rng));
 		zpos.push(zbetween.ind_sample(&mut rng));
 		radius.push(rbetween.ind_sample(&mut rng));
 		colors.push(colorbetween.ind_sample(&mut rng));
-		//colors.push(ball_color);
+		//colors.push(sphere_color);
 	}
 	
 	// strip mutability
@@ -234,7 +234,7 @@ fn do_calculation( num_balls: usize,
     // OpenCL source
 		// TODO: rewrite kernel and parameter passing to use 64bit addressing consistently
 		let source = r#"
-		__kernel void draw_balls(
+		__kernel void draw_spheres(
 					  __private unsigned long const xres,
 					  __private unsigned long const yres,
 					  __private unsigned long const zbegin,
@@ -326,7 +326,7 @@ fn do_calculation( num_balls: usize,
 									Ok(v) => println!( "OpenCL program compiled ok: {}", v ),
 									Err(e) => panic!( "OpenCL program could not be compiled: {}", e ),
 								}
-								let kernel = program.create_kernel("draw_balls");
+								let kernel = program.create_kernel("draw_spheres");
 
 								println!("Set static kernel parameters");
 								kernel.set_arg(0, &xres);
@@ -376,7 +376,7 @@ fn do_calculation( num_balls: usize,
 									kernel.set_arg(3, &zend);
 	
 									println!("Queue kernel");
-									let event = queue.enqueue_async_kernel(&kernel, num_balls, None, ());
+									let event = queue.enqueue_async_kernel(&kernel, num_spheres, None, ());
 	
 									println!("Read back volume");
 									{

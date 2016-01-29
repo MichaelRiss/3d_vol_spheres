@@ -1,12 +1,12 @@
 [package]
 
-name = "3d_vol_balls"
+name = "3d_vol_spheres"
 version = "0.0.1"
 authors = [ "Michael Riss <Michael.Riss@gmail.com>" ]
 
 [[bin]]
 
-name = "3d_vol_balls"
+name = "3d_vol_spheres"
 
 [dependencies]
 opencl = { git = "https://github.com/MichaelRiss/rust-opencl.git", branch = "extended_deviceinfo" }
